@@ -24,6 +24,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { useTheme } from "@/hooks/use-theme";
 import { useClashWorker } from "@/hooks/use-clash-worker";
 import { TABLE_ACCEPT, readTableFile } from "@/lib/read-table-file";
+import { readKmlFile } from "@/lib/read-kml";
 import type { Cell, Clash, ClashGroup } from "@/lib/mod3";
 import { ChevronDown, Github, Link2, Linkedin, Globe, Search, X } from "lucide-react";
 
@@ -421,6 +422,40 @@ export default function HomeClient() {
     abortRef.current?.abort();
     abortRef.current = null;
     setTask(null);
+  };
+
+  const handleKmlUpload = async (file: File) => {
+    try {
+      const res = await readKmlFile(file);
+      if (res.errors.length) {
+        setFileError(res.errors.join("; "));
+        setErrorPanel({
+          title: "Some KML points could not be read",
+          detail: res.errors.join("\n"),
+          hint: "The file may contain legend overlays or unsupported placemark types. Points with 'Serving Cell Identity: N' are used directly.",
+        });
+      }
+      if (res.cells.length) {
+        setRaw("");
+        setFileName(file.name);
+        setFileError(null);
+        setParsedUpload({
+          text: "",
+          cells: res.cells,
+          errors: res.errors,
+        });
+        setMetrics((m) => ({
+          ...m,
+          cellsParsed: res.cells.length,
+          loadMs: 0,
+          parseMs: 0,
+        }));
+      } else {
+        setFileError("No Serving Cell Identity points found in KML.");
+      }
+    } catch (e) {
+      setFileError(e instanceof Error ? e.message : "Failed to read KML/KMZ.");
+    }
   };
 
   const handleUpload = async (file?: File | null) => {
@@ -1083,6 +1118,22 @@ export default function HomeClient() {
                 <div className="flex flex-wrap items-center gap-1.5">
                   <Button variant="outline" size="sm" onClick={downloadTemplate}>
                     Download template
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const input = document.createElement("input");
+                      input.type = "file";
+                      input.accept = ".kmz,.kml";
+                      input.onchange = (e) => {
+                        const f = (e.target as HTMLInputElement).files?.[0];
+                        if (f) void handleKmlUpload(f);
+                      };
+                      input.click();
+                    }}
+                  >
+                    Import KML / KMZ
                   </Button>
                   <Button variant="ghost" size="sm" onClick={() => setRaw(SAMPLE_CSV)}>
                     Load sample
