@@ -90,14 +90,16 @@ export async function readKmlFile(
       const lat = parseFloat(latStr);
       if (!isFinite(lon) || !isFinite(lat)) return;
 
-      // Extract PCI from description (e.g., "Serving Cell Identity: 124")
+      // Extract PCI from HTML/text description
       const descEl = pm.querySelector("description");
-      const descText = descEl ? descEl.textContent ?? "" : "";
-      const pciMatch = descText.match(/Serving Cell Identity\s*[:\-]\s*(\d+)/i);
+      const descTextRaw = descEl ? descEl.textContent ?? "" : "";
+      // Strip common HTML tags to find the number near "Serving Cell Identity"
+      const descPlain = descTextRaw.replace(/<[^>]+>/g, " ");
+      const pciMatch = descPlain.match(/Serving Cell Identity[:\-]?\s*(\d+)/i);
       const pci = pciMatch ? parseInt(pciMatch[1], 10) : null;
 
       // Skip legend overlays (they usually say "Serving Cell Identity" with corner directions)
-      if (descText.includes("upper left") || descText.includes("lower left") || descText.includes("upper right") || descText.includes("lower right")) {
+      if (descTextRaw.includes("upper left") || descTextRaw.includes("lower left") || descTextRaw.includes("upper right") || descTextRaw.includes("lower right")) {
         return;
       }
 
@@ -107,9 +109,9 @@ export async function readKmlFile(
       foundAny = true;
 
       // Build a synthetic cell from the KML point
-      const cellName = descText.trim().split("\n")[0]?.trim() || `Point ${idx}`;
+      const cellName = descTextRaw.trim().split("\n")[0]?.trim() || `Point ${idx}`;
       const id = `kml-${sourceName}-${idx}-${pci ?? 0}`;
-      const site = descText.includes("Minya") ? "Minya Cluster L700" : sourceName;
+      const site = descTextRaw.includes("Minya") ? "Minya Cluster L700" : sourceName;
 
       cells.push({
         id,
