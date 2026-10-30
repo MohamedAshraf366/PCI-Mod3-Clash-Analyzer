@@ -436,17 +436,34 @@ export default function HomeClient() {
         });
       }
       if (res.cells.length) {
-        setRaw("");
+        // Merge with existing site-table cells instead of replacing
+        const existing = parsedUpload?.cells ?? [];
+        const merged = res.cells.map((kmlCell) => {
+          // Find nearest existing cell by lat/lon (within ~100m = ~0.001°)
+          const nearest = existing.find((c) => {
+            const dLat = Math.abs(c.lat - kmlCell.lat);
+            const dLon = Math.abs(c.lon - kmlCell.lon);
+            return dLat < 0.001 && dLon < 0.001;
+          });
+          return nearest
+            ? { ...nearest, pci: kmlCell.pci, mod3: kmlCell.mod3 }
+            : kmlCell;
+        });
+        // Also keep existing cells not matched by KML
+        const kmlIds = new Set(res.cells.map((c) => c.id));
+        const kept = existing.filter((c) => !merged.some((m) => m.id === c.id));
+        const finalCells = [...merged, ...kept];
+
         setFileName(file.name);
         setFileError(null);
         setParsedUpload({
-          text: "",
-          cells: res.cells,
+          text: parsedUpload?.text ?? "",
+          cells: finalCells,
           errors: res.errors,
         });
         setMetrics((m) => ({
           ...m,
-          cellsParsed: res.cells.length,
+          cellsParsed: finalCells.length,
           loadMs: 0,
           parseMs: 0,
         }));

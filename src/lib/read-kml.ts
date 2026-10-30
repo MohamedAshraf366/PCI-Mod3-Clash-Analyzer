@@ -1,59 +1,34 @@
 /**
- * Parses an uploaded KMZ / KML file (like LTE "Serving Cell Identity" exports)
- * into Cell objects that the clash analyzer can use.
- *
- * Expected format inside the KML:
- *   - <Placemark>
- *       <Point><coordinates>lon,lat,alt</coordinates></Point>
- *       <description>Serving Cell Identity: 124</description>
- *   - Coordinates: longitude first (KML standard), then latitude
+ * Fast regex parser for large LTE KML/KMZ files.
+ * Instead of DOMParser (slow for 6,000+ placemarks), scans text directly.
+ * Handles HTML descriptions (<table>...<td>Serving Cell Identity:</td><td>357</td>)
  */
-
 export type KmlParseResult = {
   cells: import("./mod3").Cell[];
   errors: string[];
   sourceName: string;
 };
 
-function extractNumber(text: string | null | undefined): number | null {
-  if (!text) return null;
-  const m = String(text).match(/\b(\d+)\b/);
-  return m ? parseInt(m[1], 10) : null;
-}
-
-export async function readKmlFile(
-  file: File,
-): Promise<KmlParseResult> {
+export async function readKmlFile(file: File): Promise<KmlParseResult> {
   const errors: string[] = [];
   const sourceName = file.name.replace(/\.kmz$/i, "").replace(/\.kml$/i, "");
   const isKmz = file.name.toLowerCase().endsWith(".kmz");
 
   try {
     let kmlText: string;
-
     if (isKmz) {
-      // KMZ = ZIP containing .kml and possibly images/icons
-      // jszip needed only for KMZ; KML works natively.
       let JSZip: any;
       try {
         JSZip = (await import("jszip")).default;
       } catch {
-        throw new Error(
-          "KMZ files require the jszip package. Run: npm install jszip  (or use .kml directly)",
-        );
+        throw new Error("KMZ files require jszip. Run: npm install jszip (or use .kml directly)");
       }
       const arrayBuffer = await file.arrayBuffer();
       const zipInstance = await JSZip.loadAsync(arrayBuffer);
-
-      const kmlFileName = Object.keys(zipInstance.files).find(
-        (n) => n.toLowerCase().endsWith(".kml"),
+      const kmlFileName = Object.keys(zipInstance.files).find((n) =>
+        n.toLowerCase().endsWith(".kml"),
       );
-      if (!kmlFileName) {
-        throw new Error(
-          "KMZ file does not contain a .kml entry. Found files: " +
-            Object.keys(zipInstance.files).join(", "),
-        );
-      }
+      if (!kmlFileName) throw new Error("KMZ has no .kml entry: " + Object.keys(zipInstance.files).join(", "));
       const fileObj = zipInstance.file(kmlFileName);
       if (!fileObj) throw new Error("Could not open .kml from KMZ.");
       kmlText = await fileObj.async("string");
@@ -61,60 +36,39 @@ export async function readKmlFile(
       kmlText = await file.text();
     }
 
-    // Parse XML. We only need Point placemarks with descriptions.
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(kmlText, "text/xml");
-    const parseError = doc.querySelector("parsererror");
-    if (parseError) {
-      errors.push("KML file could not be parsed (invalid XML).");
-      return { cells: [], errors, sourceName };
-    }
-
-    const placemarks = doc.querySelectorAll("Placemark");
     const cells: import("./mod3").Cell[] = [];
-    let foundAny = false;
+    // Fast scan: find all Point blocks with coordinates + descriptions
+    // We use a single-pass regex to extract coordinate + description pairs
+    const pointRegex = /<Placemark[^>]*>[\s\S]*?<Point>[\s\S]*?<coordinates>([^<]+)<\/coordinates>[\s\S]*?<description>([\s\S]*?)<\/description>[\s\S]*?<\/Placemark>/gi;
 
-    placemarks.forEach((pm, idx) => {
-      const point = pm.querySelector("Point");
-      if (!point) return; // skip polygons/lines/legends
+    let match: RegExpExecArray | null;
+    let idx = 0;
+    while ((match = pointRegex.exec(kmlText)) !== null) {
+      idx++;
+      const coordStr = match[1].trim();
+      const descRaw = match[2];
 
-      const coordsEl = point.querySelector("coordinates");
-      if (!coordsEl || !coordsEl.textContent) return;
+      // Skip legend overlays (corner text)
+      const descLower = descRaw.toLowerCase();
+      if (descLower.includes("upper left") || descLower.includes("lower left") ||
+          descLower.includes("upper right") || descLower.includes("lower right")) continue;
 
-      // KML coordinates: lon,lat[,alt] — we take the first coordinate pair
-      const firstPair = coordsEl.textContent.trim().split(/\s+/)[0];
-      if (!firstPair) return;
-
+      // Extract first coordinate pair: lon,lat[,alt]
+      const firstPair = coordStr.split(/\s+/)[0];
       const [lonStr, latStr] = firstPair.split(",");
       const lon = parseFloat(lonStr);
       const lat = parseFloat(latStr);
-      if (!isFinite(lon) || !isFinite(lat)) return;
+      if (!isFinite(lon) || !isFinite(lat)) continue;
 
-      // Extract PCI from HTML/text description
-      const descEl = pm.querySelector("description");
-      const descTextRaw = descEl ? descEl.textContent ?? "" : "";
-      // Strip common HTML tags to find the number near "Serving Cell Identity"
-      const descPlain = descTextRaw.replace(/<[^>]+>/g, " ");
+      // Extract PCI: strip HTML tags, find number near "Serving Cell Identity"
+      const descPlain = descRaw.replace(/<[^>]+>/g, " ");
       const pciMatch = descPlain.match(/Serving Cell Identity[:\-]?\s*(\d+)/i);
       const pci = pciMatch ? parseInt(pciMatch[1], 10) : null;
 
-      // Skip legend overlays (they usually say "Serving Cell Identity" with corner directions)
-      if (descTextRaw.includes("upper left") || descTextRaw.includes("lower left") || descTextRaw.includes("upper right") || descTextRaw.includes("lower right")) {
-        return;
-      }
-
-      // Only include points that actually have a PCI value from the description,
-      // OR points that have no legend-like text but have a numeric identity.
-      // If no PCI found in description, skip unless this looks like a data point.
-      foundAny = true;
-
-      // Build a synthetic cell from the KML point
-      const cellName = descTextRaw.trim().split("\n")[0]?.trim() || `Point ${idx}`;
-      const id = `kml-${sourceName}-${idx}-${pci ?? 0}`;
-      const site = descTextRaw.includes("Minya") ? "Minya Cluster L700" : sourceName;
-
+      // We accept points with PCI; if no PCI found but point is not a legend, still include with 0
+      const site = descPlain.toLowerCase().includes("minya") ? "Minya Cluster L700" : sourceName;
       cells.push({
-        id,
+        id: `kml-${sourceName}-${idx}-${pci ?? 0}`,
         site,
         cellName: pci ? `Cell ID: ${pci}` : `Point ${idx}`,
         band: "All",
@@ -127,19 +81,14 @@ export async function readKmlFile(
         lnbts: site,
         lncel: String(pci || idx),
       });
-    });
-
-    if (!foundAny) {
-      errors.push(
-        "No cell points with 'Serving Cell Identity' found in KML. Make sure the file is a cell identity / sector map.",
-      );
     }
 
+    if (cells.length === 0) {
+      errors.push("No Serving Cell Identity points found. Make sure file is a cell identity / sector map with Point placemarks.");
+    }
     return { cells, errors, sourceName };
   } catch (e: unknown) {
-    errors.push(
-      e instanceof Error ? `Failed to read KML file: ${e.message}` : "Failed to read KML file.",
-    );
+    errors.push(e instanceof Error ? `Failed to read KML file: ${e.message}` : "Failed to read KML file.");
     return { cells: [], errors, sourceName };
   }
 }
