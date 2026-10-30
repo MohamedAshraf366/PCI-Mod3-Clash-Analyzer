@@ -35,6 +35,8 @@ import {
   parseSites,
   parseSitesChunked,
   pointInPolygon,
+  sectorPolygon,
+  sectorCenter,
 } from "@/lib/mod3";
 
 const ClashMap = lazy(() => import("@/components/ClashMap"));
@@ -850,6 +852,126 @@ export default function HomeClient() {
       }),
     ]);
 
+  /**
+   * KML export for Google Earth: sector polygons with the resolved PCIs plus the
+   * clash links exactly as drawn on the map (own colours/width), and a second
+   * folder with the links that remain after the re-plan.
+   */
+  const exportKml = () => {
+    // KML colours are AABBGGRR (alpha, blue, green, red) — the reverse of #RRGGBB.
+    const kmlColor = (hex: string, alpha = "ff") =>
+      `${alpha}${hex.slice(5, 7)}${hex.slice(3, 5)}${hex.slice(1, 3)}`;
+    // Escape text that goes inside XML elements (numeric character references,
+    // valid in XML 1.0 and unaffected by template-literal quirks).
+    const esc = (v: unknown) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+    const kmlParts: string[] = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<kml xmlns="http://www.opengis.net/kml/2.2">',
+      "  <Document>",
+      "    <name>PCI Mod3 Clash Analysis</name>",
+      `    <description>LTE sectors with resolved PCI/Mod3 (${resolvedCells.length} cells), the clash links detected on the map (${clashes.length} pairs) and the links remaining after the PCI re-plan (${resolvedClashes.length} pairs)</description>`,
+    ];
+
+    // One style per Mod3 value, matching the on-map sector colours.
+    MOD3_COLORS.forEach((color, m) => {
+      kmlParts.push(
+        `    <Style id="mod3-${m}">`,
+        `      <LineStyle><color>${kmlColor(color)}</color><width>2</width></LineStyle>`,
+        `      <PolyStyle><color>${kmlColor(color, "99")}</color><fill>1</fill><outline>1</outline></PolyStyle>`,
+        `    </Style>`,
+      );
+    });
+
+    kmlParts.push("    <Folder>", `      <name>Sectors (${resolvedCells.length})</name>`);
+
+    // Sector polygons — the resolved cells, coloured by (new) Mod3.
+    resolvedCells.forEach((c) => {
+      const poly = sectorPolygon(c.lat, c.lon, c.azimuth, beamwidth, sectorRadius);
+      // KML expects lon,lat,alt.
+      const coords = poly.map(([lat, lon]) => `${lon},${lat},0`).join(" ");
+      kmlParts.push(
+        `      <Placemark>`,
+        `        <name>${esc(c.cellName)}</name>`,
+        `        <description><![CDATA[Site: ${esc(c.site)}<br/>Band: ${esc(c.band)}<br/>PCI: ${c.pci}<br/>Mod3: ${c.mod3}<br/>Azimuth: ${c.azimuth}°]]></description>`,
+        `        <ExtendedData>`,
+        `          <Data name="Site"><value>${esc(c.site)}</value></Data>`,
+        `          <Data name="Cell"><value>${esc(c.cellName)}</value></Data>`,
+        `          <Data name="Band"><value>${esc(c.band)}</value></Data>`,
+        `          <Data name="PCI"><value>${c.pci}</value></Data>`,
+        `          <Data name="Mod3"><value>${c.mod3}</value></Data>`,
+        `          <Data name="Azimuth"><value>${c.azimuth}</value></Data>`,
+        `          <Data name="MRBTS"><value>${esc(c.mrbts)}</value></Data>`,
+        `          <Data name="LNBTS"><value>${esc(c.lnbts)}</value></Data>`,
+        `          <Data name="LNCEL"><value>${esc(c.lncel)}</value></Data>`,
+        `        </ExtendedData>`,
+        `        <styleUrl>#mod3-${c.mod3}</styleUrl>`,
+        `        <Polygon>`,
+        `          <tessellate>1</tessellate>`,
+        `          <outerBoundaryIs>`,
+        `            <LinearRing>`,
+        `              <coordinates>${coords}</coordinates>`,
+        `            </LinearRing>`,
+        `          </outerBoundaryIs>`,
+        `        </Polygon>`,
+        `      </Placemark>`,
+      );
+    });
+
+    kmlParts.push("    </Folder>");
+
+    // One placemark per clash link. Inline <Style> so each link keeps the exact
+    // colour/thickness it has on the map.
+    const linkPlacemark = (clash: Clash, color: string) => {
+      const pa = sectorCenter(clash.a, sectorRadius);
+      const pb = sectorCenter(clash.b, sectorRadius);
+      const coords = `${pa.lng},${pa.lat},0 ${pb.lng},${pb.lat},0`;
+      return [
+        `      <Placemark>`,
+        `        <name>${esc(clash.a.cellName)} ↔ ${esc(clash.b.cellName)}</name>`,
+        `        <description><![CDATA[<b>${esc(clash.a.cellName)}</b> (${esc(clash.a.site)}) PCI ${clash.a.pci} Mod3 ${clash.a.mod3}<br/><b>${esc(clash.b.cellName)}</b> (${esc(clash.b.site)}) PCI ${clash.b.pci} Mod3 ${clash.b.mod3}<br/>Distance: ${Math.round(clash.distanceM)} m<br/>Type: ${clash.type === "pci" ? "Same PCI" : "Mod3 clash"}${clash.manual ? "<br/>Manually added link" : ""}<br/>Reason: ${esc(clash.reason)}]]></description>`,
+        `        <Style>`,
+        `          <LineStyle><color>${kmlColor(color)}</color><width>${linkWidth}</width></LineStyle>`,
+        `        </Style>`,
+        `        <LineString>`,
+        `          <tessellate>1</tessellate>`,
+        `          <coordinates>${coords}</coordinates>`,
+        `        </LineString>`,
+        `      </Placemark>`,
+      ];
+    };
+
+    // Folder 1 — the clash links exactly as drawn on the map right now
+    // (same colours, same width, manual links included, deleted links excluded).
+    kmlParts.push("    <Folder>", `      <name>Clash links on map (${clashes.length})</name>`);
+    clashes.forEach((clash) => {
+      const key = pairKey(clash.a.id, clash.b.id);
+      const stroke = linkColors[key] ?? linkColor ?? (clash.manual ? "#38bdf8" : "#ef4444");
+      kmlParts.push(...linkPlacemark(clash, stroke));
+    });
+    kmlParts.push("    </Folder>");
+
+    // Folder 2 — what still clashes after the PCI re-plan (toggle off in Google
+    // Earth when only the before picture is needed).
+    kmlParts.push(
+      "    <Folder>",
+      `      <name>Clash links remaining after solve (${resolvedClashes.length})</name>`,
+    );
+    resolvedClashes.forEach((clash) => {
+      kmlParts.push(...linkPlacemark(clash, "#ef4444"));
+    });
+    kmlParts.push("    </Folder>", "  </Document>", "</kml>");
+    const kml = kmlParts.join("\n");
+    const url = URL.createObjectURL(
+      new Blob([kml], { type: "application/vnd.google-earth.kml+xml" }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "mod3_clash_analysis.kml";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <main className="bg-background text-foreground">
       <header className="hero-surface shrink-0 border-b border-border/80 bg-background px-6 py-4 shadow-md">
@@ -1359,43 +1481,6 @@ export default function HomeClient() {
               </div>
 
               <div className="flex min-h-[44px] flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1.5 rounded-lg border border-border bg-surface-2/40 p-1">
-                  <Button
-                    size="sm"
-                    variant={linkMode ? "default" : "ghost"}
-                    className="w-[186px] justify-start gap-1.5"
-                    onClick={() => {
-                      setLinkMode((v) => !v);
-                      setSelectedIds([]);
-                    }}
-                  >
-                    <Link2 className="h-3.5 w-3.5 shrink-0" />
-                    {linkMode ? "Selecting sectors…" : "Link sectors manually"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={commitLinks}
-                    disabled={!linkMode || selectedIds.length < 2}
-                  >
-                    Link sectors
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setSelectedIds([])}
-                    disabled={!linkMode || !selectedIds.length}
-                    className="gap-1"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                    Clear
-                  </Button>
-                </div>
-
-                <div
-                  className="mx-1 hidden h-6 w-px self-stretch bg-border sm:block"
-                  aria-hidden="true"
-                />
-
                 <MapSearch id="map-search" onSearch={findAndFocus} />
 
                 <div className="flex items-center gap-2">
@@ -1418,31 +1503,11 @@ export default function HomeClient() {
               </div>
 
               <div className="flex min-h-[34px] items-center">
-                {linkMode ? (
-                  <div
-                    role="status"
-                    aria-live="polite"
-                    className="flex w-full flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs text-primary"
-                  >
-                    <span className="relative flex h-2 w-2 shrink-0">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
-                      <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-                    </span>
-                    {selectedIds.length === 0
-                      ? "Click sectors on the map to start selecting."
-                      : selectedIds.length === 1
-                        ? "1 sector selected — click another to link them."
-                        : `${selectedIds.length} sectors selected — click more, or link them now.`}
-                    <span className="ml-auto font-mono text-sm font-semibold">
-                      {selectedIds.length}
-                    </span>
-                  </div>
-                ) : (
-                  <p className="w-full rounded-lg border border-transparent px-3 py-1.5 text-xs text-muted-foreground">
-                    Hover a link line for details · click it to delete (deleted links leave the
-                    analysis).
-                  </p>
-                )}
+                <p className="w-full rounded-lg border border-transparent px-3 py-1.5 text-xs text-muted-foreground">
+                  {linkMode
+                    ? "Link mode active — use the floating panel on the top-right of the map."
+                    : "Hover a link line for details · click it to delete (deleted links leave the analysis)."}
+                </p>
               </div>
             </div>
 
@@ -1462,6 +1527,69 @@ export default function HomeClient() {
                 >
                   {mapFull ? "Exit full screen (Esc)" : "Full screen map"}
                 </Button>
+
+                {/* Floating "link sectors" panel over the top-right of the map */}
+                <div className="absolute right-3 top-14 z-[1000] flex w-[248px] flex-col gap-1.5 rounded-xl border border-border bg-background/95 p-2 shadow-lg backdrop-blur-sm">
+                  <Button
+                    size="sm"
+                    variant={linkMode ? "default" : "outline"}
+                    className="w-full justify-start gap-1.5"
+                    aria-pressed={linkMode}
+                    onClick={() => {
+                      setLinkMode((v) => !v);
+                      setSelectedIds([]);
+                    }}
+                  >
+                    <Link2 className="h-3.5 w-3.5 shrink-0" />
+                    {linkMode ? "Selecting sectors…" : "Link sectors manually"}
+                  </Button>
+
+                  {linkMode && (
+                    <>
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          className="flex-1"
+                          onClick={commitLinks}
+                          disabled={selectedIds.length < 2}
+                        >
+                          Link sectors
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="gap-1"
+                          onClick={() => setSelectedIds([])}
+                          disabled={!selectedIds.length}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          Clear
+                        </Button>
+                      </div>
+                      <div
+                        role="status"
+                        aria-live="polite"
+                        className="flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2 py-1 text-[11px] text-primary"
+                      >
+                        <span className="relative flex h-1.5 w-1.5 shrink-0">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
+                          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
+                        </span>
+                        <span className="flex-1 leading-tight">
+                          {selectedIds.length === 0
+                            ? "Click sectors to select"
+                            : selectedIds.length === 1
+                              ? "1 selected — pick another"
+                              : `${selectedIds.length} selected — ready to link`}
+                        </span>
+                        <span className="font-mono text-xs font-semibold">
+                          {selectedIds.length}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </div>
+
                 <ClientOnly fallback={<div className="h-full w-full bg-muted" />}>
                   <Suspense fallback={<div className="h-full w-full bg-muted" />}>
                     <ClashMap
@@ -1728,6 +1856,15 @@ export default function HomeClient() {
                 </Button>
                 <Button variant="outline" size="sm" onClick={exportPdf} disabled={!clashes.length}>
                   Export PDF report
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={exportKml}
+                  disabled={!resolvedCells.length}
+                  title="Download the map data (sector polygons + clash links as drawn on the map, plus the links remaining after solve) as a KML file for Google Earth"
+                >
+                  Export KML (Google Earth)
                 </Button>
               </div>
 
