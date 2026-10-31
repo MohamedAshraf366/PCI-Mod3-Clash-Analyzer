@@ -1136,22 +1136,7 @@ export default function HomeClient() {
                   <Button variant="outline" size="sm" onClick={downloadTemplate}>
                     Download template
                   </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      const input = document.createElement("input");
-                      input.type = "file";
-                      input.accept = ".kmz,.kml";
-                      input.onchange = (e) => {
-                        const f = (e.target as HTMLInputElement).files?.[0];
-                        if (f) void handleKmlUpload(f);
-                      };
-                      input.click();
-                    }}
-                  >
-                    Import KML / KMZ
-                  </Button>
+                  
                   <Button variant="ghost" size="sm" onClick={() => setRaw(SAMPLE_CSV)}>
                     Load sample
                   </Button>
